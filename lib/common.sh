@@ -44,3 +44,4 @@ require_cmd() {
 is_uint() {
   [[ $1 =~ ^[0-9]+$ ]]
 }
+bad_fn() { echo $1; }
