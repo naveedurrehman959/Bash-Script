@@ -1,0 +1,11 @@
+[Unit]
+Description=Run healthrep every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=20
+Persistent=true
+Unit=healthrep.service
+
+[Install]
+WantedBy=timers.target

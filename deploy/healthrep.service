@@ -1,0 +1,18 @@
+[Unit]
+Description=healthrep log rotation and health report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HEALTHREP_LOCK=/run/healthrep.lock
+# stderr goes to the journal under systemd, so -q avoids duplicate logger lines
+ExecStart=/usr/local/bin/healthrep -q -c /etc/healthrep/healthrep.conf
+SyslogIdentifier=healthrep
+# exit 10 = threshold breach: report it in the journal, but do not mark the unit failed
+SuccessExitStatus=10
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
