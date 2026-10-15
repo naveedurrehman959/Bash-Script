@@ -734,15 +734,14 @@ Create a `.gitignore` file:
 ```bash
 nano .gitignore
 ```
-run these command to succeed in lab
+## run these command to succeed in lab
 
-'''bash
+```bash
 cd ~/healthrep-lab
 shellcheck -x bin/healthrep lib/*.sh
 bash tests/test_healthrep.sh
 git status
-'''
-Example:
+```
 
 ```gitignore
 # Runtime reports and generated logs
