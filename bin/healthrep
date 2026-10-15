@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# healthrep - rotate application logs and produce a JSON system health report.
+set -Eeuo pipefail
+
+readonly VERSION="1.0.0"
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+LIB_DIR=${HEALTHREP_LIB:-$SCRIPT_DIR/../lib}
+
+# shellcheck source=lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=lib/rotate.sh
+source "$LIB_DIR/rotate.sh"
+# shellcheck source=lib/health.sh
+source "$LIB_DIR/health.sh"
+
+readonly OPTSTRING=":c:l:d:k:m:u:D:M:o:RHnqvVh"
+
+# Defaults: overridden by the config file, which is overridden by options.
+LOG_DIR=/var/log/healthrep-demo
+DAYS=7
+KEEP=5
+MOUNT=/
+URL=""
+DISK_MAX=90
+MEM_MAX=90
+REPORT_DIR=""
+DRY_RUN=0
+DO_ROTATE=1
+DO_HEALTH=1
+CONFIG=""
+LOCK_FILE=${HEALTHREP_LOCK:-/tmp/healthrep-$(id -u).lock}
+TMP_DIR=""
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [options]
+  -c FILE   config file with KEY=VALUE lines
+  -l DIR    log directory to rotate (default: $LOG_DIR)
+  -d DAYS   compress *.log files older than DAYS days (default: $DAYS)
+  -k N      keep N archives per log (default: $KEEP)
+  -m MOUNT  filesystem to check (default: $MOUNT)
+  -u URL    HTTP endpoint to check (optional)
+  -D PCT    disk usage threshold in percent (default: $DISK_MAX)
+  -M PCT    memory usage threshold in percent (default: $MEM_MAX)
+  -o DIR    also write the JSON report into DIR
+  -R        skip log rotation
+  -H        skip health report
+  -n        dry run (change nothing)
+  -q        quiet: do not send messages to syslog
+  -v        verbose (debug messages)
+  -V        print version
+  -h        show this help
+Exit codes: 0 ok, 1 error, 2 usage, 3 missing dependency,
+            4 already running, 10 threshold breach
+EOF
+}
+
+cleanup() {
+  local rc=$?
+  if [[ -n $TMP_DIR && -d $TMP_DIR ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+  log DEBUG "exiting with code $rc"
+  exit "$rc"
+}
+
+on_err() {
+  local rc=$? line=$1 cmd=$2
+  log ERROR "command failed (exit $rc) at line $line: $cmd"
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE" || die "cannot open lock file $LOCK_FILE" 1
+  flock -n 9 || die "another instance is running (lock: $LOCK_FILE)" 4
+}
+
+load_config() {
+  local file=$1 key value
+  [[ -r $file ]] || die "cannot read config file: $file" 2
+  while IFS='=' read -r key value || [[ -n $key ]]; do
+    key=${key//[[:space:]]/}
+    if [[ -z $key || $key == \#* ]]; then
+      continue
+    fi
+    value=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' <<<"$value")
+    case $key in
+      LOG_DIR | DAYS | KEEP | MOUNT | URL | DISK_MAX | MEM_MAX | REPORT_DIR)
+        printf -v "$key" '%s' "$value"
+        ;;
+      *) log WARN "ignoring unknown config key: $key" ;;
+    esac
+  done <"$file"
+}
+
+preparse_config() {
+  local opt
+  OPTIND=1
+  while getopts "$OPTSTRING" opt; do
+    if [[ $opt == c ]]; then
+      CONFIG=$OPTARG
+    fi
+  done
+  return 0
+}
+
+parse_args() {
+  local opt
+  OPTIND=1
+  while getopts "$OPTSTRING" opt; do
+    case $opt in
+      c) ;; # already handled by preparse_config
+      l) LOG_DIR=$OPTARG ;;
+      d) DAYS=$OPTARG ;;
+      k) KEEP=$OPTARG ;;
+      m) MOUNT=$OPTARG ;;
+      u) URL=$OPTARG ;;
+      D) DISK_MAX=$OPTARG ;;
+      M) MEM_MAX=$OPTARG ;;
+      o) REPORT_DIR=$OPTARG ;;
+      R) DO_ROTATE=0 ;;
+      H) DO_HEALTH=0 ;;
+      n) DRY_RUN=1 ;;
+      q) HR_SYSLOG=0 ;;
+      v) HR_VERBOSE=1 ;;
+      V)
+        echo "healthrep $VERSION"
+        exit 0
+        ;;
+      h)
+        usage
+        exit 0
+        ;;
+      :)
+        usage >&2
+        die "option -$OPTARG requires an argument" 2
+        ;;
+      \?)
+        usage >&2
+        die "unknown option: -$OPTARG" 2
+        ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  (($# == 0)) || die "unexpected argument(s): $*" 2
+}
+
+validate() {
+  local v
+  for v in DAYS KEEP DISK_MAX MEM_MAX; do
+    is_uint "${!v}" || die "$v must be a non-negative integer (got '${!v}')" 2
+  done
+  ((DISK_MAX <= 100 && MEM_MAX <= 100)) || die "thresholds must be between 0 and 100" 2
+  ((KEEP >= 1)) || die "KEEP must be at least 1" 2
+}
+
+main() {
+  trap cleanup EXIT
+  trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
+  trap 'log WARN "interrupted (SIGINT)"; exit 130' INT
+  trap 'log WARN "terminated (SIGTERM)"; exit 143' TERM
+
+  preparse_config "$@"
+  if [[ -n $CONFIG ]]; then
+    load_config "$CONFIG"
+  fi
+  parse_args "$@"
+  validate
+  require_cmd find gzip awk jq curl flock df ps
+  acquire_lock
+
+  TMP_DIR=$(mktemp -d -t healthrep.XXXXXX)
+  log INFO "healthrep $VERSION starting (dry_run=$DRY_RUN rotate=$DO_ROTATE health=$DO_HEALTH)"
+
+  local rc=0 report out
+  if ((DO_ROTATE)); then
+    rotate_logs "$LOG_DIR" "$DAYS" "$KEEP" "$DRY_RUN"
+  fi
+  if ((DO_HEALTH)); then
+    report=$(build_report "$MOUNT" "$URL")
+    printf '%s\n' "$report" >"$TMP_DIR/report.json"
+    if [[ -n $REPORT_DIR ]]; then
+      mkdir -p -- "$REPORT_DIR"
+      out="$REPORT_DIR/health-$(date +%Y%m%d-%H%M%S).json"
+      cp -- "$TMP_DIR/report.json" "$out.tmp"
+      mv -- "$out.tmp" "$out"
+      log INFO "report written to $out"
+    fi
+    printf '%s\n' "$report"
+    evaluate_report "$report" "$DISK_MAX" "$MEM_MAX" || rc=$?
+  fi
+  log INFO "finished (exit code $rc)"
+  exit "$rc"
+}
+
+main "$@"
